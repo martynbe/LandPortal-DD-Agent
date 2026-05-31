@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 LandPortal DD Slack Bot — /dd slash command handler
-Environment variables: SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, LANDPORTAL_JWT
+Environment variables: SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, LANDPORTAL_JWT,
+                       GOOGLE_SERVICE_ACCOUNT_JSON (optional), GOOGLE_DRIVE_FOLDER_ID (optional)
 """
 
 import hashlib
@@ -25,9 +26,12 @@ log = logging.getLogger(__name__)
 
 app = FastAPI()
 
-SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
-SLACK_BOT_TOKEN      = os.environ.get("SLACK_BOT_TOKEN", "")
-LP_TOKEN             = os.environ.get("LANDPORTAL_JWT", "")
+SLACK_SIGNING_SECRET      = os.environ.get("SLACK_SIGNING_SECRET", "")
+SLACK_BOT_TOKEN           = os.environ.get("SLACK_BOT_TOKEN", "")
+LP_TOKEN                  = os.environ.get("LANDPORTAL_JWT", "")
+GOOGLE_SA_JSON            = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_DRIVE_FOLDER_ID    = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
+GDRIVE_FOLDER_NAME        = "LandPortal Due Diligence Agent Reports"
 LP_BASE              = "https://landportal.com/wp-json/lp-rest-api/v1"
 LP_HEADERS           = {"Authorization": f"Bearer {LP_TOKEN}", "Content-Type": "application/json"}
 SCRIPT_DIR           = Path(__file__).parent
@@ -94,6 +98,68 @@ def slack_upload_pdf(channel: str, pdf_path: str, filename: str, title: str):
     except Exception as e:
         log.error(f"PDF upload failed: {e}\n{traceback.format_exc()}")
         slack_post(channel, f"⚠️ PDF generated but upload failed: {e}")
+
+
+# ── Google Drive helper ────────────────────────────────────────────────────────
+
+def _get_or_create_drive_folder(service, folder_name: str) -> str:
+    """Find existing Drive folder by name, or create it. Returns folder ID."""
+    q = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    results = service.files().list(q=q, fields="files(id, name)").execute()
+    files = results.get("files", [])
+    if files:
+        log.info(f"Found existing Drive folder '{folder_name}': {files[0]['id']}")
+        return files[0]["id"]
+    folder_meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+    folder = service.files().create(body=folder_meta, fields="id").execute()
+    log.info(f"Created Drive folder '{folder_name}': {folder['id']}")
+    return folder["id"]
+
+
+def upload_to_google_drive(pdf_path: str, filename: str) -> str | None:
+    """Upload PDF to Google Drive. Auto-creates 'LandPortal Due Diligence Agent Reports' folder if needed."""
+    if not GOOGLE_SA_JSON:
+        log.info("Google Drive not configured (GOOGLE_SERVICE_ACCOUNT_JSON missing) — skipping")
+        return None
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(GOOGLE_SA_JSON),
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        # Use env-var folder ID if set, otherwise auto-find/create the named folder
+        folder_id = GOOGLE_DRIVE_FOLDER_ID or _get_or_create_drive_folder(service, GDRIVE_FOLDER_NAME)
+
+        file_meta = {"name": filename, "parents": [folder_id]}
+        media = MediaFileUpload(pdf_path, mimetype="application/pdf")
+        f = service.files().create(body=file_meta, media_body=media, fields="id,webViewLink").execute()
+        link = f.get("webViewLink")
+        log.info(f"Google Drive upload OK: {link}")
+        return link
+    except Exception as e:
+        log.error(f"Google Drive upload failed: {e}\n{traceback.format_exc()}")
+        return None
+
+
+def make_report_filename(address: str, owner: str, apn: str, county: str, state: str) -> str:
+    """Build the standard report filename: address, owner, APN, county state.
+    If no address is available, uses '0 Street Name' as placeholder."""
+    empty = ("Unknown", "N/A", "", None)
+    addr_clean = address.strip() if address and address.strip() not in empty else "0 Street Name"
+    owner_clean = owner.strip() if owner and owner.strip() not in empty else "Unknown Owner"
+    apn_clean   = apn.strip()   if apn   and apn.strip()   not in empty else "No APN"
+    loc_clean   = f"{county} {state}".strip() if (county or state) else "Unknown Location"
+
+    name = f"{addr_clean}, {owner_clean}, {apn_clean}, {loc_clean}"
+    # Sanitize for filesystem / Drive
+    for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        name = name.replace(ch, '-')
+    return f"{name}.pdf"
 
 
 # ── LandPortal API helpers ─────────────────────────────────────────────────────
@@ -169,6 +235,81 @@ def _to_float(val):
         return None
 
 
+# ── Comp parser ───────────────────────────────────────────────────────────────
+
+def _parse_similars(similars_raw, subject_acres, subject_county):
+    """Parse the similars field from property data into comp list."""
+    if not similars_raw:
+        return []
+    try:
+        # May be a JSON string or already a list/dict
+        if isinstance(similars_raw, str):
+            similars = json.loads(similars_raw)
+        else:
+            similars = similars_raw
+
+        if not isinstance(similars, list):
+            similars = [similars]
+
+        comps = []
+        for s in similars:
+            if not isinstance(s, dict):
+                continue
+            acres       = _to_float(s.get("calc_acres") or s.get("lotsizeacres") or s.get("size") or s.get("acres"))
+            price       = _to_float(s.get("currentsalesprice") or s.get("saleprice") or s.get("price"))
+            price_acre  = _to_float(s.get("price_per_acre") or s.get("ppa"))
+            distance    = _to_float(s.get("distance") or s.get("distance_mi") or s.get("dist"))
+            county      = s.get("situscounty") or s.get("county") or ""
+            landlocked  = s.get("land_locked", False)
+            date        = s.get("currentsalerecordingdate") or s.get("sale_date") or s.get("date") or ""
+            address     = s.get("situsfullstreetaddress") or s.get("address") or "Unknown"
+            prop_id     = s.get("propertyid") or s.get("id")
+            lp_url      = s.get("link") or (f"https://landportal.com/property/{prop_id}" if prop_id else "")
+
+            # Calculate price_per_acre if missing
+            if not price_acre and price and acres and acres > 0:
+                price_acre = price / acres
+
+            if not price_acre or not acres:
+                continue
+
+            # Proximity filter — hard cap 50 miles; must be same county OR within 30 miles
+            same_county = (subject_county.lower() in county.lower()) if (subject_county and county) else True
+            hard_too_far = distance is not None and distance > 50   # never use comps > 50 mi
+            diff_county_and_far = (distance is not None and distance > 30 and not same_county)
+
+            # Size filter: 0.3x to 3x subject size
+            if subject_acres:
+                size_ok = (subject_acres * 0.3) <= acres <= (subject_acres * 3.0)
+            else:
+                size_ok = True
+
+            if hard_too_far or diff_county_and_far:
+                kept = False
+            else:
+                kept = size_ok and not landlocked
+
+            comps.append({
+                "date":          str(date)[:10] if date else "",
+                "address":       address,
+                "acres":         acres,
+                "price_per_acre": price_acre,
+                "distance_mi":   distance if distance is not None else 0,
+                "landlocked":    landlocked,
+                "kept":          kept,
+                "lp_url":        lp_url,
+            })
+
+        # Sort: same-county first, then by distance
+        comps.sort(key=lambda c: (not (subject_county.lower() in (c.get("address","").lower())),
+                                   c.get("distance_mi") or 999))
+        log.info(f"_parse_similars: {len(comps)} total, {sum(1 for c in comps if c['kept'])} kept")
+        return comps
+    except Exception as e:
+        log.error(f"_parse_similars error: {e}\n{traceback.format_exc()}")
+        return []
+
+
 # ── Main DD workflow ───────────────────────────────────────────────────────────
 
 def run_dd(channel: str, text: str, user_name: str):
@@ -221,12 +362,32 @@ def _run_dd(channel: str, text: str, user_name: str):
     pd_resp = lp_property_data(propertyid, fips)
     pf = pd_resp.get("data", {}).get("property", {}) if pd_resp else {}
     log.info(f"Property fields: {list(pf.keys())}")
+    # Deep field dump — used to identify correct LP API field names
+    _debug_fields = [
+        'tlp_estimate','avm_value','estimated_value','lp_estimate','estimate_price',
+        'lp_avm','property_value','avm_estimate','land_value','total_value',
+        'buildability_total_perc','buildable_pct','slope_buildable_pct','buildable_percentage',
+        'buildability_area_acres','buildable_area_acres','slope_avg','avg_slope',
+        'slope_flat_pct','slope_minimal_pct','slope_moderate_pct','slope_heavy_pct','slope_extreme_pct',
+        'currentsalerecordingdate','lastsaledate','last_sale_date','sale_date','saledate',
+        'currentsalesprice','lastsaleprice','last_sale_price','sale_price',
+        'assdtotalvalue','markettotalvalue','assessedvalue','assessed_value','land_assessed_value',
+        'taxamt','tax_amount','annualtax','annual_tax','taxyear',
+        'concurrentmtgloanamt','mortgage_balance','mtgamt','mortgage_amount',
+        'similars','comparables','comps',
+        'centroidlatitude','centroidlongitude','lat','lon','latitude','longitude',
+    ]
+    for _f in _debug_fields:
+        _v = pf.get(_f)
+        if _v is not None:
+            log.info(f"  pf[{_f!r}] = {str(_v)[:120]}")
 
     address = pf.get("situsfullstreetaddress") or prop_meta.get("address", "Unknown")
     owner   = pf.get("ownername1full") or prop_meta.get("owner", "Unknown")
     apn     = pf.get("apn") or prop_meta.get("apn", "N/A")
     county  = pf.get("situscounty") or prop_meta.get("county", "")
     state_  = pf.get("situsstate") or prop_meta.get("state", "")
+    log.info(f"Similars field type: {type(pf.get('similars'))} value: {str(pf.get('similars'))[:500]}")
 
     # Step 4 — comp report
     log.info("Fetching comp report...")
@@ -248,19 +409,47 @@ def _run_dd(channel: str, text: str, user_name: str):
             comp_report_pending = True
             log.info("Comp report still pending — continuing without it")
 
-    log.info(f"Comp report data: {str(comp_report)[:300] if comp_report else 'None'}")
+    log.info(f"Comp report keys: {list(comp_report.keys()) if comp_report else 'None'}")
+    if comp_report:
+        _cr_debug = [
+            'similars','comparables','comps','sales',
+            'total_our_estimation_values_base','avm_value','estimated_value','estimation_value',
+            'buildability_total_perc','buildable_pct','assessed_value','tax_amount',
+            'price_acre_mean','price_acre_county','size','updated_at',
+        ]
+        for _f in _cr_debug:
+            _v = comp_report.get(_f)
+            if _v is not None:
+                log.info(f"  cr[{_f!r}] = {str(_v)[:120]}")
 
     # Step 5 — assemble data
     log.info("Assembling data payload...")
     cr    = comp_report or {}
-    acres = _to_float(cr.get("size") or pf.get("acreageformatted") or pf.get("acreage"))
+    acres = _to_float(cr.get("size") or pf.get("calc_acres") or pf.get("lotsizeacres") or pf.get("acreageformatted"))
 
-    price_acre_mean = _to_float(cr.get("price_acre_mean"))
-    comps = []
-    if price_acre_mean and acres:
-        comps = [{"date": str(cr.get("updated_at", ""))[:10], "address": "LandPortal comp median",
-                  "acres": acres, "price_per_acre": price_acre_mean, "distance_mi": 0,
-                  "landlocked": False, "kept": True, "lp_url": ""}]
+    # Parse similars — try property data first, then comp report fields
+    similars_raw = (pf.get("similars") or cr.get("similars") or
+                    cr.get("comparables") or cr.get("comps") or cr.get("sales"))
+    comps = _parse_similars(similars_raw, acres, county)
+    log.info(f"Parsed {len(comps)} comps from similars (source: {'pf' if pf.get('similars') else 'cr'})")
+
+    # Fallback: use price_acre_mean from comp report as a synthetic comp
+    if not comps:
+        price_acre_mean = _to_float(cr.get("price_acre_mean"))
+        if price_acre_mean and acres:
+            comps = [{"date": str(cr.get("updated_at", ""))[:10],
+                      "address": "LandPortal comp median (county avg)",
+                      "acres": acres, "price_per_acre": price_acre_mean,
+                      "distance_mi": None,   # None so it doesn't trigger 999-mile flag
+                      "landlocked": False, "kept": True, "lp_url": ""}]
+
+    # Build LP property URL — try multiple field names, fall back to constructed URL
+    lp_url = (
+        pf.get("property_url") or pf.get("url") or pf.get("link") or
+        cr.get("property_url") or cr.get("url") or cr.get("link") or
+        f"https://landportal.com/property/{propertyid}"
+    )
+    log.info(f"LP property URL: {lp_url}")
 
     data = {
         "property": {
@@ -272,20 +461,61 @@ def _run_dd(channel: str, text: str, user_name: str):
             "fips":              str(fips),
             "state":             state_,
             "acres":             acres,
-            "frontage_ft":       _to_float(cr.get("road_frontage") or pf.get("frontage")),
-            "landlocked":        cr.get("land_locked"),
-            "wetlands_pct":      _to_float(cr.get("wetlands_cover_percentage")),
-            "fema_pct":          _to_float(cr.get("fema_cover_percentage")),
-            "buildable_pct":     None,
-            "use_code":          cr.get("landuse") or pf.get("landuse"),
-            "last_sale_date":    pf.get("lastsaledate"),
-            "last_sale_amount":  _to_float(pf.get("lastsaleamount")),
-            "lp_estimate":       _to_float(cr.get("total_our_estimation_values_base") or pf.get("lp_estimated_value")),
-            "assessed_value":    _to_float(pf.get("totalassessedvalue")),
-            "annual_tax":        _to_float(pf.get("annualtaxamount")),
-            "mortgage_balance":  _to_float(pf.get("mortgagebalance")),
-            "improvement_value": _to_float(pf.get("improvementvalue")) or 0,
-            "lp_property_url":   f"https://landportal.com/property/{propertyid}",
+            "frontage_ft":       _to_float(pf.get("road_frontage") or cr.get("road_frontage") or
+                                           pf.get("frontage") or cr.get("frontage")),
+            "landlocked":        pf.get("land_locked") if pf.get("land_locked") is not None else cr.get("land_locked"),
+            "wetlands_pct":      _to_float(pf.get("wetlands_cover_percentage") or cr.get("wetlands_cover_percentage") or
+                                           pf.get("wetlands_pct") or cr.get("wetlands_pct")),
+            "fema_pct":          _to_float(pf.get("fema_cover_percentage") or cr.get("fema_cover_percentage") or
+                                           pf.get("fema_pct") or cr.get("fema_pct")),
+            "buildable_pct":     _to_float(pf.get("buildability_total_perc") or cr.get("buildability_total_perc") or
+                                           pf.get("buildable_pct") or cr.get("buildable_pct") or
+                                           pf.get("slope_buildable_pct") or cr.get("slope_buildable_pct") or
+                                           pf.get("buildable_percentage") or cr.get("buildable_percentage")),
+            "use_code":          pf.get("landusecodedescription") or cr.get("landuse") or pf.get("landuse"),
+            "last_sale_date":    (pf.get("currentsalerecordingdate") or pf.get("lastsaledate") or
+                                  pf.get("last_sale_date") or cr.get("sale_date") or
+                                  cr.get("currentsalerecordingdate")),
+            "last_sale_amount":  _to_float(cr.get("currentsalesprice") or pf.get("currentsalesprice") or
+                                           cr.get("sale_price") or pf.get("sale_price") or
+                                           cr.get("lastsaleprice") or pf.get("lastsaleprice")),
+            "lp_estimate":       _to_float(pf.get("tlp_estimate") or pf.get("avm_value") or
+                                           pf.get("estimated_value") or pf.get("land_value_estimate") or
+                                           pf.get("lp_estimate") or
+                                           cr.get("total_our_estimation_values_base") or
+                                           cr.get("avm_value") or cr.get("estimated_value") or
+                                           cr.get("estimation_value")),
+            "assessed_value":    _to_float(pf.get("assdtotalvalue") or pf.get("markettotalvalue") or
+                                           pf.get("assessedvalue") or pf.get("assessed_value") or
+                                           pf.get("total_assessed_value") or cr.get("assessed_value") or
+                                           cr.get("assdtotalvalue")),
+            "annual_tax":        _to_float(pf.get("taxamt") or pf.get("tax_amount") or
+                                           pf.get("annualtax") or pf.get("annual_tax") or
+                                           cr.get("taxamt") or cr.get("tax_amount")),
+            "mortgage_balance":  _to_float(pf.get("concurrentmtgloanamt") or pf.get("mortgage_balance") or
+                                           pf.get("mtgamt") or pf.get("mortgage_amount") or
+                                           cr.get("concurrentmtgloanamt") or cr.get("mortgage_balance")),
+            "improvement_value": _to_float(pf.get("assdimprovementvalue")) or 0,
+            "lp_property_url":   lp_url,
+            # Slope / buildability detail
+            "buildable_area_acres": _to_float(
+                pf.get("buildability_area_acres") or cr.get("buildability_area_acres") or
+                pf.get("buildable_area_acres")   or cr.get("buildable_area_acres")),
+            "slope_avg_pct":     _to_float(pf.get("slope_avg") or cr.get("slope_avg") or
+                                           pf.get("avg_slope") or cr.get("avg_slope")),
+            "slope_flat_pct":    _to_float(pf.get("slope_flat_pct") or pf.get("flat_slope_pct") or
+                                           cr.get("slope_flat_pct")),
+            "slope_minimal_pct": _to_float(pf.get("slope_minimal_pct") or pf.get("minimal_slope_pct") or
+                                           cr.get("slope_minimal_pct")),
+            "slope_moderate_pct":_to_float(pf.get("slope_moderate_pct") or pf.get("moderate_slope_pct") or
+                                           cr.get("slope_moderate_pct")),
+            "slope_heavy_pct":   _to_float(pf.get("slope_heavy_pct") or pf.get("heavy_slope_pct") or
+                                           cr.get("slope_heavy_pct")),
+            "slope_extreme_pct": _to_float(pf.get("slope_extreme_pct") or pf.get("extreme_slope_pct") or
+                                           cr.get("slope_extreme_pct")),
+            # Coordinates for map image
+            "lat": _to_float(pf.get("centroidlatitude") or pf.get("lat") or pf.get("latitude")),
+            "lon": _to_float(pf.get("centroidlongitude") or pf.get("lon") or pf.get("longitude")),
         },
         "comp_report":         cr,
         "comps":               comps,
@@ -293,7 +523,7 @@ def _run_dd(channel: str, text: str, user_name: str):
         "skip_trace_phones":   [],
         "comp_report_pending": comp_report_pending,
     }
-    log.info(f"Data assembled. acres={acres} lp_estimate={data['property']['lp_estimate']}")
+    log.info(f"Data assembled. acres={acres} lp_estimate={data['property']['lp_estimate']} buildable={data['property']['buildable_pct']}")
 
     # Step 6 — generate PDF
     log.info("Writing data JSON...")
@@ -353,14 +583,23 @@ def _run_dd(channel: str, text: str, user_name: str):
         f"*{address}*  |  Owner: {owner}  |  APN: {apn}\n"
         f"*EV:* {ev_str}  |  *Offer:* {offer_str}\n"
         f"*Red flags:*\n{flags_str}\n"
-        f"<https://landportal.com/property/{propertyid}|View on LandPortal>"
+        f"<{lp_url}|View on LandPortal>"
     )
+
+    # Build descriptive filename
+    report_filename = make_report_filename(address, owner, apn, county, state_)
+    log.info(f"Report filename: {report_filename}")
+
+    # Upload to Google Drive
+    gdrive_link = upload_to_google_drive(pdf_path, report_filename)
+    if gdrive_link:
+        summary += f"\n<{gdrive_link}|📁 View in Google Drive>"
 
     log.info("Posting summary to Slack...")
     slack_post(channel, summary)
 
-    log.info("Uploading PDF...")
-    slack_upload_pdf(channel, pdf_path, f"DD_{safe_apn}.pdf", f"DD Report — {address}")
+    log.info("Uploading PDF to Slack...")
+    slack_upload_pdf(channel, pdf_path, report_filename, f"DD Report — {address}")
 
     try:
         os.unlink(pdf_path)

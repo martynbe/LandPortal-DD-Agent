@@ -12,11 +12,16 @@ Environment variables required:
 import hashlib
 import hmac
 import json
+import logging
 import os
 import subprocess
 import tempfile
 import time
+import traceback
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
 import requests
 from fastapi import BackgroundTasks, Request
@@ -170,13 +175,22 @@ def parse_input(text: str):
 
 def run_dd(channel: str, text: str, user_name: str):
     """Full DD workflow — runs in FastAPI background task."""
+    log.info(f"run_dd started: channel={channel} text={text} user={user_name}")
+    try:
+        _run_dd_inner(channel, text, user_name)
+    except Exception as e:
+        log.error(f"run_dd unhandled exception: {e}\n{traceback.format_exc()}")
+        slack_post(channel, f"❌ Unexpected error: {e}")
 
+
+def _run_dd_inner(channel: str, text: str, user_name: str):
     parsed = parse_input(text)
     if not parsed:
         slack_post(channel, "❌ Couldn't parse input. Try: `/dd 20-0857 Scioto OH` or `/dd John Smith OH`")
         return
 
     slack_post(channel, f"🔍 @{user_name} — running DD on *{text}* ... results in ~30 sec")
+    log.info(f"Parsed input: {parsed}")
 
     # ── Step 1: Resolve parcel ────────────────────────────────────────────────
     propertyid, fips, prop_meta = None, None, {}
@@ -212,8 +226,12 @@ def run_dd(channel: str, text: str, user_name: str):
         slack_post(channel, "❌ Couldn't resolve propertyid/FIPS.")
         return
 
+    log.info(f"Resolved: propertyid={propertyid} fips={fips}")
+
     # ── Step 2: Property data ─────────────────────────────────────────────────
+    log.info("Fetching property data...")
     pd_resp   = lp_property_data(propertyid, fips)
+    log.info(f"Property data response: {str(pd_resp)[:200]}")
     pf        = pd_resp.get("data", {}).get("property", {}) if pd_resp else {}
 
     address   = pf.get("situsfullstreetaddress") or prop_meta.get("address", "Unknown")
@@ -223,7 +241,9 @@ def run_dd(channel: str, text: str, user_name: str):
     state_    = pf.get("situsstate") or prop_meta.get("state", "")
 
     # ── Step 3: Comp report ───────────────────────────────────────────────────
+    log.info("Checking comp report...")
     comp_report = lp_get_report(propertyid, fips)
+    log.info(f"Comp report exists: {comp_report is not None}")
     comp_report_pending = False
 
     if not comp_report:

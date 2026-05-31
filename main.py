@@ -237,12 +237,19 @@ def _to_float(val):
 
 # ── Comp parser ───────────────────────────────────────────────────────────────
 
+def _first_not_none(*vals):
+    """Return first value that is not None (unlike `or`, treats 0 as valid)."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
 def _parse_similars(similars_raw, subject_acres, subject_county):
     """Parse the similars field from property data into comp list."""
     if not similars_raw:
         return []
     try:
-        # May be a JSON string or already a list/dict
         if isinstance(similars_raw, str):
             similars = json.loads(similars_raw)
         else:
@@ -255,30 +262,45 @@ def _parse_similars(similars_raw, subject_acres, subject_county):
         for s in similars:
             if not isinstance(s, dict):
                 continue
-            acres       = _to_float(s.get("calc_acres") or s.get("lotsizeacres") or s.get("size") or s.get("acres"))
-            price       = _to_float(s.get("currentsalesprice") or s.get("saleprice") or s.get("price"))
-            price_acre  = _to_float(s.get("price_per_acre") or s.get("ppa"))
-            distance    = _to_float(s.get("distance") or s.get("distance_mi") or s.get("dist"))
-            county      = s.get("situscounty") or s.get("county") or ""
-            landlocked  = s.get("land_locked", False)
-            date        = s.get("currentsalerecordingdate") or s.get("sale_date") or s.get("date") or ""
-            address     = s.get("situsfullstreetaddress") or s.get("address") or "Unknown"
-            prop_id     = s.get("propertyid") or s.get("id")
-            lp_url      = s.get("link") or (f"https://landportal.com/property/{prop_id}" if prop_id else "")
+
+            # LP similars use area_acres / mls_price / new_date (confirmed from API logs)
+            acres      = _to_float(_first_not_none(
+                s.get("area_acres"), s.get("calc_acres"), s.get("lotsizeacres"), s.get("size"), s.get("acres")))
+            price      = _to_float(_first_not_none(
+                s.get("mls_price"), s.get("currentsalesprice"), s.get("saleprice"), s.get("price")))
+            price_acre = _to_float(_first_not_none(
+                s.get("price_acre"), s.get("price_acreage"), s.get("price_per_acre"), s.get("ppa")))
+            distance   = _to_float(_first_not_none(
+                s.get("distance"), s.get("distance_mi"), s.get("dist")))
+            county     = s.get("situscounty") or s.get("county") or ""
+            landlocked = s.get("land_locked", False)
+            date       = s.get("new_date") or s.get("currentsalerecordingdate") or s.get("sale_date") or s.get("date") or ""
+            address    = s.get("situsfullstreetaddress") or s.get("address") or f"APN {s.get('apn', 'Unknown')}"
+            prop_id    = s.get("propertyid") or s.get("id")
+            lp_url     = s.get("link") or (f"https://landportal.com/property/{prop_id}" if prop_id else "")
+
+            # Only use sold comps
+            status = (s.get("mls_status") or "").lower()
+            if status and status not in ("sold", ""):
+                continue
 
             # Calculate price_per_acre if missing
-            if not price_acre and price and acres and acres > 0:
+            if price_acre is None and price is not None and acres and acres > 0:
                 price_acre = price / acres
 
             if not price_acre or not acres:
                 continue
 
-            # Proximity filter — hard cap 50 miles; must be same county OR within 30 miles
-            same_county = (subject_county.lower() in county.lower()) if (subject_county and county) else True
-            hard_too_far = distance is not None and distance > 50   # never use comps > 50 mi
-            diff_county_and_far = (distance is not None and distance > 30 and not same_county)
+            # County match: fip_to_fip=0 means same FIPS/county (most reliable)
+            fip_to_fip  = s.get("fip_to_fip")
+            same_county = (
+                fip_to_fip == 0
+                or (subject_county and county and subject_county.lower() in county.lower())
+                or (fip_to_fip is None)  # if no fip data, don't filter on county
+            )
+            hard_too_far       = distance is not None and distance > 50
+            diff_county_and_far = distance is not None and distance > 30 and not same_county
 
-            # Size filter: 0.3x to 3x subject size
             if subject_acres:
                 size_ok = (subject_acres * 0.3) <= acres <= (subject_acres * 3.0)
             else:
@@ -290,19 +312,20 @@ def _parse_similars(similars_raw, subject_acres, subject_county):
                 kept = size_ok and not landlocked
 
             comps.append({
-                "date":          str(date)[:10] if date else "",
-                "address":       address,
-                "acres":         acres,
+                "date":           str(date)[:10] if date else "",
+                "address":        address,
+                "acres":          acres,
                 "price_per_acre": price_acre,
-                "distance_mi":   distance if distance is not None else 0,
-                "landlocked":    landlocked,
-                "kept":          kept,
-                "lp_url":        lp_url,
+                "distance_mi":    distance,
+                "landlocked":     landlocked,
+                "kept":           kept,
+                "lp_url":         lp_url,
             })
 
-        # Sort: same-county first, then by distance
-        comps.sort(key=lambda c: (not (subject_county.lower() in (c.get("address","").lower())),
-                                   c.get("distance_mi") or 999))
+        comps.sort(key=lambda c: (
+            not (c.get("distance_mi") is not None and c.get("distance_mi", 999) <= 30),
+            c.get("distance_mi") if c.get("distance_mi") is not None else 999
+        ))
         log.info(f"_parse_similars: {len(comps)} total, {sum(1 for c in comps if c['kept'])} kept")
         return comps
     except Exception as e:
@@ -476,46 +499,58 @@ def _run_dd(channel: str, text: str, user_name: str):
             "last_sale_date":    (pf.get("currentsalerecordingdate") or pf.get("lastsaledate") or
                                   pf.get("last_sale_date") or cr.get("sale_date") or
                                   cr.get("currentsalerecordingdate")),
-            "last_sale_amount":  _to_float(cr.get("currentsalesprice") or pf.get("currentsalesprice") or
-                                           cr.get("sale_price") or pf.get("sale_price") or
-                                           cr.get("lastsaleprice") or pf.get("lastsaleprice")),
-            "lp_estimate":       _to_float(pf.get("tlp_estimate") or pf.get("avm_value") or
-                                           pf.get("estimated_value") or pf.get("land_value_estimate") or
-                                           pf.get("lp_estimate") or
-                                           cr.get("total_our_estimation_values_base") or
-                                           cr.get("avm_value") or cr.get("estimated_value") or
-                                           cr.get("estimation_value")),
-            "assessed_value":    _to_float(pf.get("assdtotalvalue") or pf.get("markettotalvalue") or
-                                           pf.get("assessedvalue") or pf.get("assessed_value") or
-                                           pf.get("total_assessed_value") or cr.get("assessed_value") or
-                                           cr.get("assdtotalvalue")),
-            "annual_tax":        _to_float(pf.get("taxamt") or pf.get("tax_amount") or
-                                           pf.get("annualtax") or pf.get("annual_tax") or
-                                           cr.get("taxamt") or cr.get("tax_amount")),
-            "mortgage_balance":  _to_float(pf.get("concurrentmtgloanamt") or pf.get("mortgage_balance") or
-                                           pf.get("mtgamt") or pf.get("mortgage_amount") or
-                                           cr.get("concurrentmtgloanamt") or cr.get("mortgage_balance")),
+            # Use _first_not_none so 0 values (e.g. $0 sale price) are preserved
+            "last_sale_amount":  _to_float(_first_not_none(
+                cr.get("currentsalesprice"), pf.get("currentsalesprice"),
+                cr.get("sale_price"), pf.get("sale_price"),
+                cr.get("lastsaleprice"), pf.get("lastsaleprice"))),
+            "lp_estimate":       _to_float(_first_not_none(
+                pf.get("tlp_estimate"), pf.get("avm_value"), pf.get("estimated_value"),
+                pf.get("lp_estimate"), cr.get("total_our_estimation_values_base"),
+                cr.get("avm_value"), cr.get("estimated_value"))),
+            "assessed_value":    _to_float(_first_not_none(
+                pf.get("assdtotalvalue"), pf.get("markettotalvalue"),
+                pf.get("assessedvalue"), pf.get("assessed_value"),
+                cr.get("assessed_value"), cr.get("assdtotalvalue"))),
+            "annual_tax":        _to_float(_first_not_none(
+                pf.get("taxamt"), pf.get("tax_amount"), pf.get("annualtax"),
+                cr.get("taxamt"), cr.get("tax_amount"))),
+            "mortgage_balance":  _to_float(_first_not_none(
+                pf.get("concurrentmtgloanamt"), pf.get("mortgage_balance"),
+                pf.get("mtgamt"), cr.get("concurrentmtgloanamt"), cr.get("mortgage_balance"))),
             "improvement_value": _to_float(pf.get("assdimprovementvalue")) or 0,
             "lp_property_url":   lp_url,
-            # Slope / buildability detail
-            "buildable_area_acres": _to_float(
-                pf.get("buildability_area_acres") or cr.get("buildability_area_acres") or
-                pf.get("buildable_area_acres")   or cr.get("buildable_area_acres")),
-            "slope_avg_pct":     _to_float(pf.get("slope_avg") or cr.get("slope_avg") or
-                                           pf.get("avg_slope") or cr.get("avg_slope")),
-            "slope_flat_pct":    _to_float(pf.get("slope_flat_pct") or pf.get("flat_slope_pct") or
-                                           cr.get("slope_flat_pct")),
-            "slope_minimal_pct": _to_float(pf.get("slope_minimal_pct") or pf.get("minimal_slope_pct") or
-                                           cr.get("slope_minimal_pct")),
-            "slope_moderate_pct":_to_float(pf.get("slope_moderate_pct") or pf.get("moderate_slope_pct") or
-                                           cr.get("slope_moderate_pct")),
-            "slope_heavy_pct":   _to_float(pf.get("slope_heavy_pct") or pf.get("heavy_slope_pct") or
-                                           cr.get("slope_heavy_pct")),
-            "slope_extreme_pct": _to_float(pf.get("slope_extreme_pct") or pf.get("extreme_slope_pct") or
-                                           cr.get("slope_extreme_pct")),
-            # Coordinates for map image
-            "lat": _to_float(pf.get("centroidlatitude") or pf.get("lat") or pf.get("latitude")),
-            "lon": _to_float(pf.get("centroidlongitude") or pf.get("lon") or pf.get("longitude")),
+            # ZIP avg (stored here so PDF can access via property dict)
+            "zip_avg_per_acre":  _to_float(cr.get("price_acre_county")),
+            # Slope / buildability — confirmed field names from API logs
+            "buildable_area_acres": _to_float(_first_not_none(
+                pf.get("buildability_area"), cr.get("buildability_area"),
+                pf.get("buildability_area_acres"), cr.get("buildability_area_acres"))),
+            "slope_avg_pct":     _to_float(_first_not_none(
+                pf.get("slope_average"), cr.get("slope_average"),
+                pf.get("slope_avg"), cr.get("slope_avg"))),
+            "slope_flat_pct":    _to_float(_first_not_none(
+                pf.get("percentage_of_land_with_flat_slope_0_05"),
+                cr.get("flop_05"), pf.get("flop_05"))),
+            "slope_minimal_pct": _to_float(_first_not_none(
+                pf.get("percentage_of_land_with_minimal_slope_05_5"),
+                cr.get("flop5"), pf.get("flop5"))),
+            "slope_moderate_pct":_to_float(_first_not_none(
+                pf.get("percentage_of_land_with_moderate_slope_5_10"),
+                cr.get("rlop5_10"), pf.get("rlop5_10"))),
+            "slope_heavy_pct":   _to_float(_first_not_none(
+                pf.get("percentage_of_land_with_high_slope_10_15"),
+                cr.get("flop10_15"), pf.get("flop10_15"))),
+            "slope_extreme_pct": _to_float(_first_not_none(
+                pf.get("percentage_of_land_with_extreme_slope_15"),
+                cr.get("flopls"), pf.get("flopls"))),
+            # Coordinates
+            "lat": _to_float(_first_not_none(
+                pf.get("situslatitude"), pf.get("centroidlatitude"), pf.get("lat"))),
+            "lon": _to_float(_first_not_none(
+                pf.get("situslongitude"), pf.get("centroidlongitude"), pf.get("lon"))),
+            # Satellite image (downloaded below)
+            "satellite_image_path": None,
         },
         "comp_report":         cr,
         "comps":               comps,
@@ -524,6 +559,22 @@ def _run_dd(channel: str, text: str, user_name: str):
         "comp_report_pending": comp_report_pending,
     }
     log.info(f"Data assembled. acres={acres} lp_estimate={data['property']['lp_estimate']} buildable={data['property']['buildable_pct']}")
+
+    # Download satellite image from comp report
+    sat_url = cr.get("satellite_path")
+    if sat_url:
+        try:
+            sat_r = requests.get(sat_url, headers=LP_HEADERS, timeout=15)
+            if not sat_r.ok:
+                sat_r = requests.get(sat_url, timeout=15)  # try without auth
+            if sat_r.ok and sat_r.content:
+                sat_file = f"/tmp/sat_{propertyid}.jpg"
+                with open(sat_file, "wb") as sf:
+                    sf.write(sat_r.content)
+                data["property"]["satellite_image_path"] = sat_file
+                log.info(f"Satellite image saved: {sat_file}")
+        except Exception as e:
+            log.warning(f"Satellite image download failed: {e}")
 
     # Step 6 — generate PDF
     log.info("Writing data JSON...")

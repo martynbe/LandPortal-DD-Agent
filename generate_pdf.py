@@ -475,7 +475,17 @@ def _fmt_money(v):
 
 def _fmt_pct(v):
     if v is None: return "Unknown"
-    return f"{v}%"
+    return f"{v:.1f}%" if isinstance(v, float) else f"{v}%"
+
+
+def _fmt_date(v):
+    """Format dates like 20060615 or 2006-06-15 → 06/15/2006."""
+    if not v:
+        return "N/A"
+    s = str(v).replace("-", "").replace("/", "").strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[4:6]}/{s[6:8]}/{s[:4]}"
+    return str(v)
 
 
 def _page_cover(p, scores, styles, comp_report_pending):
@@ -563,6 +573,22 @@ def _page_cover(p, scores, styles, comp_report_pending):
         els.append(Paragraph(f'<a href="{lp_url}" color="#2E7D32">🔗 View on Land Portal</a>', styles["link"]))
         els.append(Spacer(1, 10))
 
+    # Satellite / aerial image
+    sat_path = p.get("satellite_image_path")
+    if sat_path:
+        import os as _os
+        if _os.path.exists(sat_path):
+            try:
+                from reportlab.platypus import Image as _RLImage
+                sat_img = _RLImage(sat_path, width=7.65 * inch, height=4.0 * inch, kind="bound")
+                els.append(Paragraph("Property Aerial View", styles["h3"]))
+                els.append(Spacer(1, 4))
+                els.append(sat_img)
+                els.append(Spacer(1, 8))
+            except Exception as _e:
+                els.append(Paragraph(f"[Aerial image unavailable: {_e}]", styles["small"]))
+                els.append(Spacer(1, 4))
+
     if comp_report_pending:
         els.append(Paragraph(
             "⚠️ Comp report still generating — EV and comp data may be incomplete.",
@@ -633,7 +659,7 @@ def _page_detail(p, comps, scores, styles):
         row("Heavy (10–15%)", _fmt_pct(p.get("slope_heavy_pct"))),
         row("Extreme (15%+)", _fmt_pct(p.get("slope_extreme_pct"))),
         row("Use Code",       p.get("use_code")),
-        row("Last Sale Date", p.get("last_sale_date")),
+        row("Last Sale Date", _fmt_date(p.get("last_sale_date"))),
         row("Last Sale Amt",  _fmt_money(p.get("last_sale_amount"))),
         row("LP AVM Estimate",_fmt_money(p.get("lp_estimate"))),
         row("Assessed Value", _fmt_money(p.get("assessed_value"))),

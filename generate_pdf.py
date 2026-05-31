@@ -361,31 +361,44 @@ def _calc_offer(stance, ev, acres, frontage, buildable, wetlands, fema, landlock
     )
 
     if can_subdivide:
+        # Subdivide: 55–70% of EV (highest value strategy)
         low = round(ev * 0.55 / 1000) * 1000
         high = round(ev * 0.70 / 1000) * 1000
         strategy = "SUBDIVIDE"
     elif stance == "PURSUE":
-        # Fast market check (comp_count >= 5 handled externally via avg_dom)
-        low = round(ev * 0.40 / 1000) * 1000
+        # Straight flip: offer 30–50% of calculated market value
+        low = round(ev * 0.30 / 1000) * 1000
         high = round(ev * 0.50 / 1000) * 1000
         strategy = "FLIP"
-    else:  # PURSUE WITH CAUTION
+    else:
+        # Cautious flip: offer 30–50% of calculated market value
         low = round(ev * 0.30 / 1000) * 1000
-        high = round(ev * 0.40 / 1000) * 1000
+        high = round(ev * 0.50 / 1000) * 1000
         strategy = "FLIP CAUTIOUS"
 
-    # Double close
-    dc_price = (low - 10000) if low else None
-    dc_viable = dc_price and dc_price >= high * 1.05
+    # Double close: buy at low, sell to end buyer at low + $10k minimum
+    # Viable when the spread between low and high covers $10k profit
+    spread = (high - low) if (high and low) else 0
+    dc_viable = spread >= 10000
+    dc_min_sell = (low + 10000) if dc_viable else None
+
+    dc_reason = None
     if not dc_viable:
-        dc_price = None
+        if spread > 0:
+            dc_reason = (
+                f"Spread between low and high offer is only ${spread:,.0f} — "
+                f"need at least $10,000 to guarantee minimum profit on a double close"
+            )
+        else:
+            dc_reason = "EV too low to calculate a viable double close spread"
 
     return {
         "strategy": strategy,
         "low": low,
         "high": high,
-        "double_close": dc_price,
+        "double_close": dc_min_sell,          # minimum price to charge end buyer
         "double_close_viable": dc_viable,
+        "double_close_reason": dc_reason,
     }
 
 
@@ -800,9 +813,13 @@ def _page_decision(scores, styles, phones):
     else:
         primary_str = strategy_str
 
-    dc_str = "N/A — double close not viable"
-    if offer.get("double_close_viable") and offer.get("double_close"):
-        dc_str = f"Double close at ${offer['double_close']:,.0f}"
+    dc_reason = offer.get("double_close_reason", "")
+    dc_str = f"Not viable — {dc_reason}" if dc_reason else "Not viable"
+    if offer.get("double_close_viable") and offer.get("double_close") and offer.get("low"):
+        dc_str = (
+            f"Buy at ${offer['low']:,.0f} → sell to end buyer at min ${offer['double_close']:,.0f} "
+            f"(${offer['double_close'] - offer['low']:,.0f} profit)"
+        )
 
     reasoning = _build_reasoning(scores)
 

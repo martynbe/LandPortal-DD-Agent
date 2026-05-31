@@ -60,17 +60,39 @@ def slack_post(channel: str, text: str):
 def slack_upload_pdf(channel: str, pdf_path: str, filename: str, title: str):
     log.info(f"Uploading PDF to Slack: {pdf_path}")
     try:
+        file_size = os.path.getsize(pdf_path)
+        headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+
+        # Step 1 — get upload URL
+        r1 = requests.post(
+            "https://slack.com/api/files.getUploadURLExternal",
+            headers=headers,
+            data={"filename": filename, "length": file_size},
+            timeout=15,
+        )
+        log.info(f"getUploadURLExternal: {r1.status_code} {r1.text[:200]}")
+        r1_data = r1.json()
+        if not r1_data.get("ok"):
+            slack_post(channel, f"⚠️ Could not get upload URL: {r1_data.get('error')}")
+            return
+        upload_url = r1_data["upload_url"]
+        file_id    = r1_data["file_id"]
+
+        # Step 2 — upload the file
         with open(pdf_path, "rb") as f:
-            r = requests.post(
-                "https://slack.com/api/files.upload",
-                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-                data={"channels": channel, "filename": filename, "title": title},
-                files={"file": f},
-                timeout=30,
-            )
-        log.info(f"Slack upload response: {r.status_code} {r.text[:200]}")
+            r2 = requests.post(upload_url, data=f, timeout=30)
+        log.info(f"File upload: {r2.status_code}")
+
+        # Step 3 — complete and share to channel
+        r3 = requests.post(
+            "https://slack.com/api/files.completeUploadExternal",
+            headers=headers,
+            json={"files": [{"id": file_id, "title": title}], "channel_id": channel},
+            timeout=15,
+        )
+        log.info(f"completeUploadExternal: {r3.status_code} {r3.text[:200]}")
     except Exception as e:
-        log.error(f"PDF upload failed: {e}")
+        log.error(f"PDF upload failed: {e}\n{traceback.format_exc()}")
         slack_post(channel, f"⚠️ PDF generated but upload failed: {e}")
 
 

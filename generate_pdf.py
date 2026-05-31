@@ -267,7 +267,10 @@ def score_parcel(p, comps, zip_avg_per_acre=None):
         if local_count < 3:
             red_flags.append(f"Sparse comp set: only {local_count} clean comps")
         if comps:
-            min_dist = min((c.get("distance_mi") or 999) for c in comps)
+            min_dist = min(
+                (c["distance_mi"] if c.get("distance_mi") is not None else 999)
+                for c in comps
+            )
             if min_dist > 15:
                 red_flags.append(f"Distant comps — closest is {min_dist:.1f} mi away")
 
@@ -376,29 +379,27 @@ def _calc_offer(stance, ev, acres, frontage, buildable, wetlands, fema, landlock
         high = round(ev * 0.50 / 1000) * 1000
         strategy = "FLIP CAUTIOUS"
 
-    # Double close: buy at low, sell to end buyer at low + $10k minimum
-    # Viable when the spread between low and high covers $10k profit
-    spread = (high - low) if (high and low) else 0
-    dc_viable = spread >= 10000
-    dc_min_sell = (low + 10000) if dc_viable else None
+    # Double close: end buyer pays 90% of EV (incentivizes quick sale)
+    # You offer seller (90% of EV - $12k) → gross $12k → net $10k after ~$2k closing costs
+    dc_end_buyer_price = round(ev * 0.90 / 1000) * 1000
+    dc_seller_price    = dc_end_buyer_price - 12000
+    dc_viable          = dc_seller_price > 0
 
     dc_reason = None
     if not dc_viable:
-        if spread > 0:
-            dc_reason = (
-                f"Spread between low and high offer is only ${spread:,.0f} — "
-                f"need at least $10,000 to guarantee minimum profit on a double close"
-            )
-        else:
-            dc_reason = "EV too low to calculate a viable double close spread"
+        dc_reason = (
+            f"EV too low — 90% of market value is only ${dc_end_buyer_price:,.0f}, "
+            f"less than the $12,000 needed to cover costs and net $10k profit"
+        )
 
     return {
-        "strategy": strategy,
-        "low": low,
-        "high": high,
-        "double_close": dc_min_sell,          # minimum price to charge end buyer
-        "double_close_viable": dc_viable,
-        "double_close_reason": dc_reason,
+        "strategy":               strategy,
+        "low":                    low,
+        "high":                   high,
+        "double_close":           dc_seller_price if dc_viable else None,
+        "double_close_end_buyer": dc_end_buyer_price,
+        "double_close_viable":    dc_viable,
+        "double_close_reason":    dc_reason,
     }
 
 
@@ -624,7 +625,13 @@ def _page_detail(p, comps, scores, styles):
         row("Land-Locked",    "Yes ⚠️" if p.get("landlocked") else "No"),
         row("Wetlands",       _fmt_pct(p.get("wetlands_pct"))),
         row("FEMA Flood Zone",_fmt_pct(p.get("fema_pct"))),
-        row("Buildable",      _fmt_pct(p.get("buildable_pct"))),
+        row("Buildable %",    _fmt_pct(p.get("buildable_pct"))),
+        row("Buildable Acres", f"{p['buildable_area_acres']:.2f} ac" if p.get("buildable_area_acres") else None),
+        row("Avg Slope",      f"{p['slope_avg_pct']:.1f}%" if p.get("slope_avg_pct") else None),
+        row("Flat (0–5%)",    _fmt_pct(p.get("slope_flat_pct"))),
+        row("Mod (5–10%)",    _fmt_pct(p.get("slope_moderate_pct"))),
+        row("Heavy (10–15%)", _fmt_pct(p.get("slope_heavy_pct"))),
+        row("Extreme (15%+)", _fmt_pct(p.get("slope_extreme_pct"))),
         row("Use Code",       p.get("use_code")),
         row("Last Sale Date", p.get("last_sale_date")),
         row("Last Sale Amt",  _fmt_money(p.get("last_sale_amount"))),
@@ -815,10 +822,11 @@ def _page_decision(scores, styles, phones):
 
     dc_reason = offer.get("double_close_reason", "")
     dc_str = f"Not viable — {dc_reason}" if dc_reason else "Not viable"
-    if offer.get("double_close_viable") and offer.get("double_close") and offer.get("low"):
+    if offer.get("double_close_viable") and offer.get("double_close"):
+        end_buyer = offer.get("double_close_end_buyer", 0)
         dc_str = (
-            f"Buy at ${offer['low']:,.0f} → sell to end buyer at min ${offer['double_close']:,.0f} "
-            f"(${offer['double_close'] - offer['low']:,.0f} profit)"
+            f"Offer seller ${offer['double_close']:,.0f} → end buyer pays ${end_buyer:,.0f} "
+            f"(90% of market value) → you net ~$10,000 after closing costs"
         )
 
     reasoning = _build_reasoning(scores)

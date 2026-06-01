@@ -276,8 +276,7 @@ def _parse_similars(similars_raw, subject_acres, subject_county):
             landlocked = s.get("land_locked", False)
             date       = s.get("new_date") or s.get("currentsalerecordingdate") or s.get("sale_date") or s.get("date") or ""
             address    = s.get("situsfullstreetaddress") or s.get("address") or f"APN {s.get('apn', 'Unknown')}"
-            prop_id    = s.get("propertyid") or s.get("id")
-            lp_url     = s.get("link") or (f"https://landportal.com/property/{prop_id}" if prop_id else "")
+            lp_url     = s.get("link") or ""  # only use LP-provided link; constructed URLs go to homepage
 
             # Only use sold comps
             status = (s.get("mls_status") or "").lower()
@@ -499,11 +498,11 @@ def _run_dd(channel: str, text: str, user_name: str):
             "last_sale_date":    (pf.get("currentsalerecordingdate") or pf.get("lastsaledate") or
                                   pf.get("last_sale_date") or cr.get("sale_date") or
                                   cr.get("currentsalerecordingdate")),
-            # Use _first_not_none so 0 values (e.g. $0 sale price) are preserved
+            # _first_not_none preserves 0 values (e.g. $0 deed transfer sale price)
             "last_sale_amount":  _to_float(_first_not_none(
-                cr.get("currentsalesprice"), pf.get("currentsalesprice"),
-                cr.get("sale_price"), pf.get("sale_price"),
-                cr.get("lastsaleprice"), pf.get("lastsaleprice"))),
+                pf.get("currentsalesprice"), cr.get("currentsalesprice"),
+                pf.get("sale_price"), cr.get("sale_price"),
+                pf.get("lastsaleprice"), cr.get("lastsaleprice"))),
             "lp_estimate":       _to_float(_first_not_none(
                 pf.get("tlp_estimate"), pf.get("avm_value"), pf.get("estimated_value"),
                 pf.get("lp_estimate"), cr.get("total_our_estimation_values_base"),
@@ -515,9 +514,10 @@ def _run_dd(channel: str, text: str, user_name: str):
             "annual_tax":        _to_float(_first_not_none(
                 pf.get("taxamt"), pf.get("tax_amount"), pf.get("annualtax"),
                 cr.get("taxamt"), cr.get("tax_amount"))),
-            "mortgage_balance":  _to_float(_first_not_none(
+            "mortgage_balance":  (_to_float(_first_not_none(
                 pf.get("concurrentmtgloanamt"), pf.get("mortgage_balance"),
-                pf.get("mtgamt"), cr.get("concurrentmtgloanamt"), cr.get("mortgage_balance"))),
+                pf.get("mtgamt"), cr.get("concurrentmtgloanamt"), cr.get("mortgage_balance")))
+                or 0),  # default $0 when field absent (no mortgage = $0 balance)
             "improvement_value": _to_float(pf.get("assdimprovementvalue")) or 0,
             "lp_property_url":   lp_url,
             # ZIP avg (stored here so PDF can access via property dict)
